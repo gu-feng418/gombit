@@ -24,10 +24,16 @@ const TypedAPIPrefix = "/api/v1"
 //
 // The caller's document on disk is not modified (examples/client contract-drift
 // still compares live Huma paths). A spec that already uses /api/v1 is returned
-// unchanged, whatever the caller is configured with: its keys are the ones the
-// typed client wants. A configured prefix that matches no path in a spec that
-// does need rewriting is an error, because the alternative is a generated
-// client whose keys belong to no route of this app (#506).
+// unchanged, whatever rooted prefix the caller is configured with: its keys are
+// the ones the typed client wants. A configured prefix that matches no path in
+// a spec that does need rewriting is an error, because the alternative is a
+// generated client whose keys belong to no route of this app (#506). A rewrite
+// that would merge two path keys is an error too: routing the merge to one of
+// them would silently drop the other operation.
+//
+// The configured prefix is checked before the already-typed shortcut, so an
+// unrooted prefix (config's "must start with /" rule) is refused whether or not
+// the document happens to need rewriting.
 func rewriteSpecPathsForTypedClient(spec []byte, live string) ([]byte, error) {
 	var doc map[string]any
 	if err := decodeSpecDocument(spec, &doc); err != nil {
@@ -41,12 +47,12 @@ func rewriteSpecPathsForTypedClient(spec []byte, live string) ([]byte, error) {
 	for path := range rawPaths {
 		keys = append(keys, path)
 	}
-	if allTypedAPIPrefix(keys) {
-		return spec, nil
-	}
 	live, err := liveAPIPrefixForm(live)
 	if err != nil {
 		return nil, err
+	}
+	if allTypedAPIPrefix(keys) {
+		return spec, nil
 	}
 	if live == "" {
 		guessed := inferLiveAPIPrefix(keys)
@@ -65,11 +71,26 @@ func rewriteSpecPathsForTypedClient(spec []byte, live string) ([]byte, error) {
 	}
 
 	rewritten := make(map[string]any, len(rawPaths))
+	// source names the path a rewritten key came from. Two distinct keys can
+	// land on one: a path outside the live prefix keeps its key, and an inside
+	// path can rewrite onto that same key (/api/v1/health next to /svc/api/v1
+	// under live /svc, say). Keeping either one silently would drop an
+	// operation, and which one survived would be map iteration order.
+	source := make(map[string]string, len(rawPaths))
 	for path, value := range rawPaths {
 		newPath := path
 		if path == live || strings.HasPrefix(path, live+"/") {
 			newPath = TypedAPIPrefix + path[len(live):]
 		}
+		if prev, exists := source[newPath]; exists {
+			return nil, fmt.Errorf(
+				"client: paths %q and %q both rewrite to %q under the live API prefix %q: "+
+					"the document has a path outside the prefix that already starts with %s, so "+
+					"the rewrite cannot keep both operations; generate against a document whose "+
+					"paths do not overlap that way, or pass the document's own prefix with --api-prefix",
+				prev, path, newPath, live, TypedAPIPrefix)
+		}
+		source[newPath] = path
 		rewritten[newPath] = value
 	}
 	doc["paths"] = rewritten

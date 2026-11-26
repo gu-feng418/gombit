@@ -104,9 +104,11 @@ const envAPIPrefix = "GOMBIT_API_PREFIX"
 // unrelated variable that fails to parse turn a configured prefix back into a
 // guess. An unset variable is "", which leaves the generator inferring the
 // prefix from the document, as it did before the prefix became an input. A
-// .env that cannot be read is an error rather than an unset prefix, because
-// answering from half the file could turn a configured prefix back into a
-// guess.
+// variable that is set but empty or blank is an error, not an unset prefix:
+// config refuses that value ("must start with /"), and answering "" here would
+// silently replace a configuration error with the guess #506 removed. A .env
+// that cannot be read is an error for the same reason: answering from half the
+// file could turn a configured prefix back into a guess.
 func liveAPIPrefix(flagValue, dir string) (string, error) {
 	if strings.TrimSpace(flagValue) != "" {
 		return flagValue, nil
@@ -115,7 +117,16 @@ func liveAPIPrefix(flagValue, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	value, _ := lookup(envAPIPrefix)
+	value, ok := lookup(envAPIPrefix)
+	if !ok {
+		return "", nil
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf(
+			"%s is set but empty, which configuration refuses (the prefix must start with /); "+
+				"unset it to let the prefix be inferred from the OpenAPI document",
+			envAPIPrefix)
+	}
 	return value, nil
 }
 

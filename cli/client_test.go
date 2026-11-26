@@ -78,6 +78,49 @@ func TestLiveAPIPrefixIsUnsetWhenTheConfigurationDoesNotSetIt(t *testing.T) {
 	}
 }
 
+// A variable that is set but empty is refused, not answered as unset:
+// configuration refuses that value ("must start with /"), so treating it as
+// unset would quietly replace the user's configuration error with the
+// inference #506 removed (#620 review).
+func TestLiveAPIPrefixRefusesASetButEmptyVariable(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+	}{
+		{
+			name: "empty in .env",
+			setup: func(t *testing.T, dir string) {
+				// #nosec G304 -- test-controlled path under t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("GOMBIT_API_PREFIX=\n"), 0o600); err != nil {
+					t.Fatalf("write .env: %v", err)
+				}
+			},
+		},
+		{
+			name: "blank in the process environment",
+			setup: func(t *testing.T, dir string) {
+				t.Setenv("GOMBIT_API_PREFIX", "  ")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unsetEnv(t, "GOMBIT_API_PREFIX")
+			dir := t.TempDir()
+			tt.setup(t, dir)
+			got, err := liveAPIPrefix("", dir)
+			if err == nil {
+				t.Fatalf(`liveAPIPrefix("") = (%q, nil), want the empty value refused`, got)
+			}
+			for _, want := range []string{"GOMBIT_API_PREFIX", "set but empty"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %q, want it to mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // The variable is read wherever configuration is read from: the process
 // environment, or the project's .env when the environment does not set it.
 func TestLiveAPIPrefixReadsTheVariableNotTheDefaultedConfig(t *testing.T) {

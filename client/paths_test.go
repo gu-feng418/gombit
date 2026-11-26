@@ -168,6 +168,45 @@ func TestRewriteSpecPathsForTypedClientRejectsAnUnrootedPrefix(t *testing.T) {
 	}
 }
 
+// The root rule is configuration's, so it holds for every document: an
+// unrooted prefix is refused even when the document already carries the typed
+// keys and no path would need rewriting. Skipping the check there would let a
+// value config refuses produce a client (#506).
+func TestRewriteSpecPathsForTypedClientRejectsAnUnrootedPrefixOnATypedDocument(t *testing.T) {
+	t.Parallel()
+
+	spec := specWithPaths(t, []string{"/api/v1/widgets"})
+	_, err := rewriteSpecPathsForTypedClient(spec, "svc")
+	if err == nil {
+		t.Fatal("rewriteSpecPathsForTypedClient(live=svc) error = nil, want it refused on a typed document too")
+	}
+	for _, want := range []string{"svc", "must start with /"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// A path outside the live prefix keeps its key, so an outside path that
+// already looks typed can collide with one the rewrite moves onto it. Both
+// operations cannot survive under one key, and which survived would be map
+// iteration order, so the rewrite is refused rather than silently dropping an
+// operation (#506).
+func TestRewriteSpecPathsForTypedClientRejectsARewriteThatWouldMergeKeys(t *testing.T) {
+	t.Parallel()
+
+	spec := specWithPaths(t, []string{"/svc/health", "/api/v1/health"})
+	_, err := rewriteSpecPathsForTypedClient(spec, "/svc")
+	if err == nil {
+		t.Fatal("rewriteSpecPathsForTypedClient() error = nil, want the key merge refused")
+	}
+	for _, want := range []string{"/svc/health", "/api/v1/health", "both rewrite to"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
 // The rewrite is a JSON round trip that openapi-typescript then reads, so a
 // document with data after its JSON value is refused: unmarshalling used to
 // refuse it, and re-encoding silently drops the tail.
@@ -198,9 +237,11 @@ func TestRewriteSpecPathsForTypedClientAcceptsTrailingWhitespace(t *testing.T) {
 	}
 }
 
-// A document that already uses the typed keys needs no rewriting whatever the
-// caller is configured with, so a prefix that matches none of its paths is not
-// an error there: the keys are the ones the generated client wants.
+// A document that already uses the typed keys needs no rewriting whatever
+// rooted prefix the caller is configured with, so a prefix that matches none
+// of its paths is not an error there: the keys are the ones the generated
+// client wants. (The root rule itself still applies; see the unrooted-prefix
+// test above.)
 func TestRewriteSpecPathsForTypedClientKeepsATypedDocumentUntouched(t *testing.T) {
 	t.Parallel()
 
