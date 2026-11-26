@@ -801,6 +801,13 @@ var pgURICheckedDSNs = []string{
 	"postgres://app:Sup3r@[::1]:5432/db?sslmode=disable",
 	"postgres://app:Sup3r@h1,h2:5432/db",
 	"postgresql://app@h/db?password=Sup3r%40tail",
+	// Refused before the walk reaches the query, with a '/' in the query value:
+	// the fail-closed hiding must not depend on the MySQL last-'/' rule, which
+	// finds no parameter list once a query value holds a slash (#486 review).
+	"postgres://app:50%off@/db?host=/cloudsql/proj:us-central1:inst&password=s3cr3tvalue",
+	"postgres://app:50%off@/db?host=/var/run/postgresql&sslpassword=k3ypassphrase",
+	"postgres://[fe80::1/db?host=/var/run/postgresql&password=s3cr3tvalue",
+	"postgres://u%zz@h/db?host=/tmp&password=s3cr3tvalue",
 }
 
 // The mirror is pinned to the parser it mirrors: pgURIRejected answers what it
@@ -848,11 +855,16 @@ func TestPgURIRejectedAcceptsWhatTheDriversParse(t *testing.T) {
 // pgURIQuery returns the boundary secretRanges needs, and it is the driver's:
 // pgconn's database name runs to the first '?', so a slash in the userinfo, in
 // the host or in a query value moves nothing. The last-'/' rule is
-// go-sql-driver/mysql's and is never asked about a URI (#486 review).
+// go-sql-driver/mysql's and is never asked about a URI (#486 review). A walk
+// that stops before the query names no boundary at all; the fail-closed scan
+// then reads from the first '?' after the scheme instead.
 func TestPGURIQueryFindsTheParameterListTheWayTheDriverDoes(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct{ dsn, query string }{
+	tests := []struct {
+		dsn, query string
+		rejected   bool
+	}{
 		{dsn: "postgres://h/db?password=x", query: "?password=x"},
 		{dsn: "postgres://h:5432/db?password=x", query: "?password=x"},
 		{dsn: "postgres:///db?host=/var/run/postgresql&password=x", query: "?host=/var/run/postgresql&password=x"},
@@ -860,13 +872,24 @@ func TestPGURIQueryFindsTheParameterListTheWayTheDriverDoes(t *testing.T) {
 		{dsn: "postgres://h?password=x", query: "?password=x"},
 		{dsn: "postgresql://app:pa/ss@h/db?password=x", query: "?password=x"},
 		{dsn: "postgres://h/db", query: ""},
+		// Refused before the walk reaches the query, with a '/' in the query
+		// value: the walk names no boundary, and no fail-closed reading may come
+		// from the MySQL last-'/' rule (#486 review).
+		{dsn: "postgres://app:50%off@/db?host=/cloudsql/proj:us-central1:inst&password=s3cr3tvalue", rejected: true},
+		{dsn: "postgres://app:50%off@/db?host=/var/run/postgresql&sslpassword=k3ypassphrase", rejected: true},
+		{dsn: "postgres://[fe80::1/db?host=/var/run/postgresql&password=s3cr3tvalue", rejected: true},
+		{dsn: "postgres://u%zz@h/db?host=/tmp&password=s3cr3tvalue", rejected: true},
+		{dsn: "postgres://h%zz/db?host=/tmp&password=s3cr3tvalue", rejected: true},
+		{dsn: "postgres://h:%zz/db?host=/tmp&password=s3cr3tvalue", rejected: true},
+		{dsn: "postgres://[]/db?host=/tmp&password=s3cr3tvalue", rejected: true},
+		{dsn: "postgres://[::1]x/db?host=/tmp&password=s3cr3tvalue", rejected: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.dsn, func(t *testing.T) {
 			t.Parallel()
 			query, rejected := pgURIQuery(tt.dsn)
-			if rejected {
-				t.Fatalf("pgURIQuery(%q) refused a string the driver accepts", tt.dsn)
+			if rejected != tt.rejected {
+				t.Fatalf("pgURIQuery(%q) rejected = %v, want %v", tt.dsn, rejected, tt.rejected)
 			}
 			got := ""
 			if query >= 0 {
@@ -874,6 +897,45 @@ func TestPGURIQueryFindsTheParameterListTheWayTheDriverDoes(t *testing.T) {
 			}
 			if got != tt.query {
 				t.Fatalf("pgURIQuery(%q) query = %q, want %q", tt.dsn, got, tt.query)
+			}
+		})
+	}
+}
+
+// A postgres URI pgconn refuses stores no password, but the operator wrote one
+// into its parameter list, and `gombit config show` prints the string back. The
+// fail-closed boundary is the first '?' after the scheme — the one pgconn's own
+// error redactor falls back to — so a '/' in a query value cannot move it, and
+// the refused string spells nothing into messages (#486 review).
+func TestRedactDSNHidesRefusedURIQuerySecrets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ dsn, secret string }{
+		{dsn: "postgres://app:50%off@/db?host=/cloudsql/proj:us-central1:inst&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		{dsn: "postgres://app:50%off@/db?host=/var/run/postgresql&sslpassword=k3ypassphrase", secret: "k3ypassphrase"},
+		{dsn: "postgres://[fe80::1/db?host=/var/run/postgresql&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		{dsn: "postgres://u%zz@h/db?host=/tmp&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		{dsn: "postgres://h%zz/db?host=/tmp&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		{dsn: "postgres://h:%zz/db?host=/tmp&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		{dsn: "postgres://[]/db?host=/tmp&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		{dsn: "postgres://[::1]x/db?host=/tmp&password=s3cr3tvalue", secret: "s3cr3tvalue"},
+		// pgconn's userinfo lookahead swallows this '?': it parses the string as
+		// user `localhost?password=p` and host `ssw0rdvalue`, so its walk names no
+		// query here either, and main still hid what the operator wrote.
+		{dsn: "postgres://localhost?password=p@ssw0rdvalue", secret: "p@ssw0rdvalue"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.dsn, func(t *testing.T) {
+			t.Parallel()
+			printed := RedactDSN(tt.dsn)
+			if strings.Contains(printed, tt.secret) {
+				t.Fatalf("RedactDSN(%q) = %q, still contains %q", tt.dsn, printed, tt.secret)
+			}
+			if !strings.Contains(printed, RedactedSecret) {
+				t.Fatalf("RedactDSN(%q) = %q, want the password replaced", tt.dsn, printed)
+			}
+			if got := dsnSecretValues(tt.dsn); len(got) != 0 {
+				t.Fatalf("dsnSecretValues(%q) = %v, want no spelling: pgconn stores no password out of this reading", tt.dsn, got)
 			}
 		})
 	}
@@ -1035,6 +1097,11 @@ func FuzzRedactDSN(f *testing.F) {
 	for _, dsn := range driverCheckedDSNs {
 		f.Add(dsn)
 	}
+	// No driver reads a password out of a refused URI, so driverCheckedDSNs
+	// cannot carry one; the seed still pairs a pre-query rejection with a '/' in
+	// the query, the shape the MySQL last-'/' rule found no parameter list for
+	// (#486 review).
+	f.Add("postgres://app:50%off@/db?host=/var/run/postgresql&password=s3cr3tvalue")
 	f.Fuzz(func(t *testing.T, dsn string) {
 		if touchesTheFilesystem(dsn) {
 			return

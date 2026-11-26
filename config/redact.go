@@ -124,53 +124,77 @@ func secretRanges(dsn string) []secretRange {
 		out = append(out, r)
 	}
 	uri := uriRanges(dsn)
-	var query int
-	rejected := false
 	if isPostgresScheme(dsn) {
 		// pgconn reads a URI's parameters from the first '?' after the database
 		// name, which runs to that '?' — so a '/' inside a query value cannot
 		// move the boundary. paramListStart's last-'/' rule is
-		// go-sql-driver/mysql's, and applying it to a URI found no parameter list
-		// at all for `?host=/var/run/postgresql&password=…`, printing a password
-		// that main hides (#486 review).
-		query, rejected = pgURIQuery(dsn)
-		if query < 0 && rejected {
-			// The walk stopped before it reached the query, so the parameter
-			// list's boundary is unknown. pgconn stores no setting out of a
-			// string it refuses, so nothing is derived from these ranges either
-			// way; the permissive scan is kept only to hide the bytes an
-			// operator wrote there.
-			query = paramListStart(dsn)
+		// go-sql-driver/mysql's, and asking it about a URI found no parameter
+		// list at all for `?host=/var/run/postgresql&password=…`, printing a
+		// password that main hides (#486 review).
+		//
+		// The walk names no boundary when the parser refuses the string before
+		// the query, and it can miss an accepted one (an '@' after the '?' makes
+		// the userinfo lookahead swallow it). The fail-closed scan covers both:
+		// it reads from the first '?' after the scheme, where a URL's authority
+		// ends and where pgconn's own error redactor falls back to, and hides
+		// what a parameter list there holds as written. Its ranges spell nothing
+		// — pgconn stores no setting out of that reading — so pgURIQuery's
+		// boundary stays the only source of driver:true ranges.
+		query, rejected := pgURIQuery(dsn)
+		if query >= 0 {
+			uri = append(uri, paramRanges(dsn, query+1)...)
 		}
-	} else {
-		query = paramListStart(dsn)
-	}
-	if query >= 0 {
+		uri = append(uri, failClosedURIQueryRanges(dsn)...)
+		// pgconn answers with a URI's settings or with none: the first component
+		// its parser refuses fails the whole parse, so a URI it rejects stores no
+		// password, from its userinfo or its query. The ranges still describe
+		// bytes an operator wrote a secret into — RedactDSN hides them — but no
+		// spelling of them is derived, because the driver never stores one to
+		// send. The line is the parser's, not ParseConfig's: a URI that parses
+		// but fails a later check (`?password=status` names a port-shaped value)
+		// stores its password all the same, and is spelled as one. Syntactic
+		// acceptance is the stable boundary; semantic validation changes with
+		// every pgconn release.
+		if rejected {
+			for i := range uri {
+				uri[i].driver = false
+			}
+		}
+	} else if query := paramListStart(dsn); query >= 0 {
 		uri = append(uri, paramRanges(dsn, query+1)...)
 	}
-	// pgconn answers with a URI's settings or with none: the first component its
-	// parser refuses fails the whole parse, so a URI it rejects stores no
-	// password, from its userinfo or its query. The ranges still describe bytes
-	// an operator wrote a secret into — RedactDSN hides them — but no spelling of
-	// them is derived, because the driver never stores one to send. The line is
-	// the parser's, not ParseConfig's: a URI that parses but fails a later check
-	// (`?password=status` names a port-shaped value) stores its password all the
-	// same, and is spelled as one. Syntactic acceptance is the stable boundary;
-	// semantic validation changes with every pgconn release.
-	if isPostgresScheme(dsn) && rejected {
-		for i := range uri {
-			uri[i].driver = false
-		}
-	}
 	return append(out, uri...)
+}
+
+// failClosedURIQueryRanges hides the password-like parameters of a postgres URI
+// from the first '?' after its scheme, the boundary a URL's authority ends at
+// and the one pgconn's own error redactor falls back to (redactURLPassword's
+// uriQueryStart). It exists for the parameter lists pgURIQuery cannot vouch
+// for: the parser refused the string before the query, or read that '?' as
+// something else. pgconn stores no setting from those readings, so the ranges
+// spell nothing (driver: false) — they only hide the bytes an operator wrote.
+func failClosedURIQueryRanges(dsn string) []secretRange {
+	rest, _, ok := cutScheme(dsn)
+	if !ok {
+		return nil
+	}
+	query := strings.IndexByte(rest, '?')
+	if query < 0 {
+		return nil
+	}
+	ranges := paramRanges(dsn, len(dsn)-len(rest)+query+1)
+	for i := range ranges {
+		ranges[i].driver = false
+	}
+	return ranges
 }
 
 // pgURIQuery walks connString the way pgconn's parseURLSettings does and returns
 // the index of the '?' that opens the URI's parameter list (-1 when it has none
 // or the walk stopped before reaching it), and whether the parser refuses the
 // string outright, before it stores any setting. The walk is the one place the
-// query's boundary is read: pgconn's database name runs to the first '?', so
-// nothing after it — a '/', an '@', another '?' — can move it, while
+// driver's query boundary is read: pgconn's database name runs to the first '?',
+// so nothing after it — a '/', an '@', another '?' — can move it, while
 // paramListStart's last-'/' rule is go-sql-driver/mysql's and applies to the net
 // form only.
 //
